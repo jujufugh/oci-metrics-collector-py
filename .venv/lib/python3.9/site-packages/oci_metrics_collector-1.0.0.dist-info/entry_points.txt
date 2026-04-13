@@ -1,0 +1,2 @@
+[console_scripts]
+oci-metrics-collector = oci_metrics_collector.cli:main

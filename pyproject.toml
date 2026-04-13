@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oci-metrics-collector"
+version = "1.0.0"
+description = "Collect OCI compute instance metrics and ship to Autonomous Database and Log Analytics"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Royce Fu"},
+]
+dependencies = [
+    "oci>=2.120.0",
+    "oracledb>=2.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+
+[project.scripts]
+oci-metrics-collector = "oci_metrics_collector.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,222 @@
+# OCI Metrics Collector
+
+A Python library for collecting OCI compute instance metrics (CPU utilization, memory utilization, allocated resources) and shipping them to **Autonomous Database** (for ML/prediction modeling) and **OCI Log Analytics** (for operational visibility).
+
+Designed as a workaround for environments where **OCI Stack Monitoring is unavailable**.
+
+## Architecture
+
+```
+┌──────────────────────┐
+│   OCI Monitoring     │
+│  (oci_computeagent)  │
+│  - CpuUtilization    │
+│  - MemoryUtilization │
+└──────────┬───────────┘
+           │ summarize_metrics_data()
+           ▼
+┌──────────────────────┐     ┌──────────────────────┐
+│    Collector          │────▶│     Enricher          │
+│ (collector.py)        │     │  (enricher.py)        │
+│                       │     │  + Instance metadata  │
+│ Raw metric datapoints │     │  + Shape config       │
+│                       │     │  + Derived fields     │
+└───────────────────────┘     └──────────┬────────────┘
+                                         │
+                              ┌──────────┴────────────┐
+                              ▼                        ▼
+                 ┌──────────────────────┐ ┌──────────────────────┐
+                 │  Autonomous Database │ │  OCI Log Analytics   │
+                 │  (destinations/adb)  │ │  (destinations/la)   │
+                 │                      │ │                      │
+                 │  OCI_COMPUTE_METRICS │ │  upload_log_events   │
+                 │  table for ML/AI     │ │  for dashboards      │
+                 └──────────────────────┘ └──────────────────────┘
+```
+
+## Metrics Collected
+
+| Metric | Source | Description |
+|---|---|---|
+| `CpuUtilization` | OCI Monitoring | CPU activity as % of total time |
+| `MemoryUtilization` | OCI Monitoring | Used memory as % of total |
+| `cpu_allocated_ocpus` | Compute API | OCPUs allocated to the instance |
+| `memory_allocated_gbs` | Compute API | Memory (GB) allocated to the instance |
+| `cpu_usage_ocpus` | Derived | `(CpuUtilization / 100) × cpu_allocated_ocpus` |
+| `memory_used_gbs` | Derived | `(MemoryUtilization / 100) × memory_allocated_gbs` |
+
+## Prerequisites
+
+### 1. OCI Configuration
+
+- An OCI config file (`~/.oci/config`) with valid credentials, **OR**
+- Instance Principal auth (for running on OCI compute)
+
+### 2. IAM Policies
+
+```
+Allow group <your-group> to read metrics in compartment <compartment-name>
+Allow group <your-group> to read instances in compartment <compartment-name>
+Allow group <your-group> to use log-analytics-log-group in compartment <compartment-name>
+```
+
+### 3. Autonomous Database (if enabled)
+
+- An ADB instance with a wallet downloaded
+- A database user with `CREATE TABLE` and `INSERT` privileges
+- Wallet files unzipped to a local directory
+
+### 4. Log Analytics (if enabled)
+
+- Log Analytics service enabled in your tenancy
+- A **Log Group** created
+- A **custom Log Source** named `OCI Compute Metrics`:
+  - Parser type: **JSON**
+  - Entity type: **OCI Compute Instance** (optional but recommended)
+- Optionally, **Log Analytics Entities** created for your compute instances
+
+## Installation
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd oci-metrics-collector-py
+
+# Install in development mode
+pip install -e ".[dev]"
+```
+
+## Configuration
+
+```bash
+# Copy the example config
+cp config.yaml.example config.yaml
+
+# Edit with your values
+vi config.yaml
+```
+
+### Environment Variables (for secrets)
+
+```bash
+export OCI_METRICS_ADB_PASSWORD="your_db_password"
+export OCI_METRICS_ADB_WALLET_PASSWORD="your_wallet_password"
+export OCI_METRICS_COMPARTMENT_ID="ocid1.compartment.oc1..xxx"
+```
+
+## Usage
+
+### One-Shot Collection
+
+```bash
+# Collect metrics once and ship to all enabled destinations
+oci-metrics-collector collect --config config.yaml
+```
+
+### Continuous Collection (Daemon Mode)
+
+```bash
+# Collect every 5 minutes
+oci-metrics-collector collect --config config.yaml --continuous
+
+# Override interval to 60 seconds
+oci-metrics-collector collect --config config.yaml --continuous --interval 60
+```
+
+### Test Connectivity
+
+```bash
+# Verify ADB and Log Analytics connectivity
+oci-metrics-collector test-connection --config config.yaml
+```
+
+### Discover Available Metrics
+
+```bash
+# List all metrics in the oci_computeagent namespace
+oci-metrics-collector discover --config config.yaml
+
+# List all metrics across all namespaces
+oci-metrics-collector discover --config config.yaml --namespace ""
+```
+
+## ADB Table Schema
+
+The collector auto-creates this table on first run:
+
+```sql
+CREATE TABLE OCI_COMPUTE_METRICS (
+    COLLECTION_TIME        TIMESTAMP WITH TIME ZONE,
+    INSTANCE_ID            VARCHAR2(255),
+    INSTANCE_NAME          VARCHAR2(255),
+    COMPARTMENT_ID         VARCHAR2(255),
+    AVAILABILITY_DOMAIN    VARCHAR2(100),
+    FAULT_DOMAIN           VARCHAR2(100),
+    SHAPE                  VARCHAR2(100),
+    LIFECYCLE_STATE        VARCHAR2(50),
+    CPU_ALLOCATED_OCPUS    NUMBER,
+    MEMORY_ALLOCATED_GBS   NUMBER,
+    CPU_UTILIZATION_PCT    NUMBER,
+    MEMORY_UTILIZATION_PCT NUMBER,
+    CPU_USAGE_OCPUS        NUMBER,
+    MEMORY_USED_GBS        NUMBER,
+    STATISTIC_TYPE         VARCHAR2(20),
+    PRIMARY KEY (COLLECTION_TIME, INSTANCE_ID, STATISTIC_TYPE)
+);
+```
+
+### Example Queries for ML/Prediction
+
+```sql
+-- Average CPU utilization by instance over the last 7 days
+SELECT instance_name, shape,
+       ROUND(AVG(cpu_utilization_pct), 2) AS avg_cpu_pct,
+       ROUND(AVG(memory_utilization_pct), 2) AS avg_mem_pct,
+       ROUND(AVG(cpu_usage_ocpus), 2) AS avg_cpu_used,
+       ROUND(AVG(memory_used_gbs), 2) AS avg_mem_used_gb
+FROM oci_compute_metrics
+WHERE collection_time >= SYSTIMESTAMP - INTERVAL '7' DAY
+GROUP BY instance_name, shape
+ORDER BY avg_cpu_pct DESC;
+
+-- Identify underutilized instances (< 10% CPU, < 20% memory)
+SELECT instance_name, shape,
+       cpu_allocated_ocpus,
+       ROUND(AVG(cpu_utilization_pct), 2) AS avg_cpu_pct,
+       memory_allocated_gbs,
+       ROUND(AVG(memory_utilization_pct), 2) AS avg_mem_pct
+FROM oci_compute_metrics
+WHERE collection_time >= SYSTIMESTAMP - INTERVAL '30' DAY
+GROUP BY instance_name, shape, cpu_allocated_ocpus, memory_allocated_gbs
+HAVING AVG(cpu_utilization_pct) < 10 AND AVG(memory_utilization_pct) < 20
+ORDER BY cpu_allocated_ocpus DESC;
+```
+
+## Log Analytics Integration
+
+Once data flows into Log Analytics, use **Log Explorer** queries like:
+
+```
+'Log Source' = 'OCI Compute Metrics'
+| stats avg(cpu_utilization_pct) as avg_cpu,
+        avg(memory_utilization_pct) as avg_mem
+  by instance_name
+| sort -avg_cpu
+```
+
+## Development
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest tests/ -v
+
+# Run with coverage
+pytest tests/ --cov=oci_metrics_collector --cov-report=term-missing
+```
+
+## License
+
+MIT

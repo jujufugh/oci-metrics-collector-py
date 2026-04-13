@@ -1,0 +1,113 @@
+# =============================================================================
+# OCI Metrics Collector — Configuration
+# =============================================================================
+# Copy this file to config.yaml and fill in your values.
+# Secrets can be overridden via environment variables (see inline comments).
+
+# ---------------------------------------------------------------------------
+# OCI Authentication
+# ---------------------------------------------------------------------------
+oci:
+  # Auth method: "config_file" (default) or "instance_principal"
+  auth_method: "config_file"
+
+  # Path to OCI config file (only used when auth_method = config_file)
+  config_file: "~/.oci/config"
+
+  # OCI config profile name
+  profile: "DEFAULT"
+
+# ---------------------------------------------------------------------------
+# Target Scope
+# ---------------------------------------------------------------------------
+scope:
+  # Compartment OCID to collect metrics from (REQUIRED)
+  compartment_id: "ocid1.compartment.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+  # Optional: Tenancy OCID (used for cross-compartment or tenancy-level queries)
+  # tenancy_id: "ocid1.tenancy.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# ---------------------------------------------------------------------------
+# Metrics Collection Settings
+# ---------------------------------------------------------------------------
+metrics:
+  # Namespace for compute instance metrics
+  namespace: "oci_computeagent"
+
+  # Metrics to collect (from oci_computeagent namespace)
+  # Available: CpuUtilization, MemoryUtilization, DiskBytesRead,
+  #            DiskBytesWritten, NetworkBytesIn, NetworkBytesOut
+  metric_names:
+    - "CpuUtilization"
+    - "MemoryUtilization"
+
+  # MQL resolution interval (e.g., "1m", "5m", "1h")
+  resolution: "5m"
+
+  # Statistic to apply: mean, max, min, sum, p50, p90, p95, p99
+  statistic: "mean"
+
+  # How far back to look for data (in minutes) for each collection cycle
+  lookback_minutes: 10
+
+# ---------------------------------------------------------------------------
+# Autonomous Database Destination
+# ---------------------------------------------------------------------------
+adb:
+  # Enable/disable ADB output
+  enabled: true
+
+  # Wallet directory path (contains tnsnames.ora + ewallet.pem)
+  wallet_dir: "/path/to/wallet"
+
+  # DSN alias from tnsnames.ora (e.g., "mydb_high", "mydb_low")
+  dsn: "mydb_high"
+
+  # Database username
+  # Override via env var: OCI_METRICS_ADB_USER
+  user: "ADMIN"
+
+  # Database password
+  # Override via env var: OCI_METRICS_ADB_PASSWORD (RECOMMENDED)
+  password: ""
+
+  # Wallet password
+  # Override via env var: OCI_METRICS_ADB_WALLET_PASSWORD (RECOMMENDED)
+  wallet_password: ""
+
+  # Target table name
+  table_name: "OCI_COMPUTE_METRICS"
+
+# ---------------------------------------------------------------------------
+# OCI Log Analytics Destination
+# ---------------------------------------------------------------------------
+log_analytics:
+  # Enable/disable Log Analytics output
+  enabled: true
+
+  # Log Analytics namespace (find via: oci log-analytics namespace list)
+  namespace: "your_namespace"
+
+  # Log Group OCID where metrics will be uploaded
+  log_group_id: "ocid1.loganalyticsloggroup.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+  # Log Source name (must be pre-created in Log Analytics Administration)
+  log_source_name: "OCI Compute Metrics"
+
+  # Optional: Map instance OCIDs to Log Analytics Entity OCIDs
+  # If empty, logs are uploaded without entity association.
+  # entity_mapping:
+  #   "ocid1.instance.oc1.iad.xxx": "ocid1.loganalyticsentity.oc1.iad.yyy"
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+orchestration:
+  # Collection interval in seconds (used in continuous/daemon mode)
+  interval_seconds: 300
+
+  # Maximum retries for transient API failures
+  max_retries: 3
+
+  # Logging level: DEBUG, INFO, WARNING, ERROR
+  log_level: "INFO"
