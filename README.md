@@ -54,10 +54,26 @@ Designed as a workaround for environments where **OCI Stack Monitoring is unavai
 
 ### 2. IAM Policies
 
+For a user / group:
+
 ```
 Allow group <your-group> to read metrics in compartment <compartment-name>
 Allow group <your-group> to read instances in compartment <compartment-name>
 Allow group <your-group> to use log-analytics-log-group in compartment <compartment-name>
+```
+
+For **instance principal** auth (running on an OCI compute instance), create a Dynamic Group that matches the instance, then grant it the same permissions:
+
+```
+# Dynamic Group matching rule (pick one)
+instance.id = 'ocid1.instance.oc1..YOUR_INSTANCE_OCID'
+# or: instance.compartment.id = 'ocid1.compartment.oc1..YOUR_COMPARTMENT_OCID'
+
+# Policies
+Allow dynamic-group <dg-name> to read metrics   in compartment <compartment-name>
+Allow dynamic-group <dg-name> to read instances in compartment <compartment-name>
+# Only if Log Analytics destination is enabled:
+Allow dynamic-group <dg-name> to use log-analytics-log-group in compartment <compartment-name>
 ```
 
 ### 3. Autonomous Database (if enabled)
@@ -146,7 +162,7 @@ The collector auto-creates this table on first run:
 
 ```sql
 CREATE TABLE OCI_COMPUTE_METRICS (
-    COLLECTION_TIME        TIMESTAMP WITH TIME ZONE,
+    COLLECTION_TIME        TIMESTAMP,
     INSTANCE_ID            VARCHAR2(255),
     INSTANCE_NAME          VARCHAR2(255),
     COMPARTMENT_ID         VARCHAR2(255),
@@ -164,6 +180,19 @@ CREATE TABLE OCI_COMPUTE_METRICS (
     PRIMARY KEY (COLLECTION_TIME, INSTANCE_ID, STATISTIC_TYPE)
 );
 ```
+
+`COLLECTION_TIME` is plain `TIMESTAMP` (not `TIMESTAMP WITH TIME ZONE`) because Oracle ADB doesn't allow timezone-aware timestamps in a primary key (ORA-02329). Values are stored as UTC.
+
+### Writing to a different schema (e.g. `OCIRA_DEV`)
+
+Set `adb.table_name` in `config.yaml` to a schema-qualified name:
+
+```yaml
+adb:
+  table_name: "OCIRA_DEV.OCI_COMPUTE_METRICS"
+```
+
+The ADMIN user (or any user with `CREATE ANY TABLE` / `INSERT ANY TABLE`) can create and write the table in another schema.
 
 ### Example Queries for ML/Prediction
 
@@ -203,6 +232,125 @@ Once data flows into Log Analytics, use **Log Explorer** queries like:
   by instance_name
 | sort -avg_cpu
 ```
+
+## Deploy on OCI Compute (Instance Principal + systemd)
+
+This is the recommended setup for running the collector continuously against your own tenancy from an OCI compute instance. It uses instance principal auth (no API keys on disk) and systemd to keep the collector alive.
+
+### 1. Create Dynamic Group + IAM policies
+
+Match the compute instance in a Dynamic Group and grant it `read metrics` + `read instances` on the target compartment (see [IAM Policies](#2-iam-policies) above).
+
+### 2. Install on the instance
+
+```bash
+git clone <repo-url> /home/opc/oci-metrics-collector-py
+cd /home/opc/oci-metrics-collector-py
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
+```
+
+### 3. Configure
+
+```yaml
+# config.yaml
+oci:
+  auth_method: "instance_principal"
+
+scope:
+  compartment_id: "ocid1.compartment.oc1..xxxx"   # target compartment
+
+adb:
+  enabled: true
+  wallet_dir: "/home/opc/wallet_<dbname>"
+  dsn: "<dbname>_high"                            # or <dbname>_public_high for public endpoint
+  user: "ADMIN"
+  table_name: "OCI_COMPUTE_METRICS"               # or SCHEMA.TABLE
+```
+
+You can pull the compartment OCID from the instance metadata service:
+
+```bash
+curl -s -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/instance/ | jq -r '.compartmentId'
+```
+
+### 4. Store DB passwords for systemd
+
+Create `/home/opc/.env` in **systemd EnvironmentFile format** — plain `KEY=VALUE`, **no `export`**, no surrounding quotes:
+
+```ini
+# /home/opc/.env
+OCI_METRICS_ADB_PASSWORD=your_admin_password
+OCI_METRICS_ADB_WALLET_PASSWORD=your_wallet_password
+```
+
+```bash
+chmod 600 /home/opc/.env
+```
+
+> ⚠️ systemd's `EnvironmentFile=` does **not** interpret `export` and treats quotes literally. A file written with `export VAR="..."` will be silently ignored, causing `ORA-01017: invalid credential` at runtime.
+
+### 5. Verify connectivity
+
+```bash
+set -a; source /home/opc/.env; set +a
+source /home/opc/oci-metrics-collector-py/venv/bin/activate
+oci-metrics-collector test-connection --config config.yaml
+```
+
+### 6. Install the systemd unit
+
+Create `/etc/systemd/system/oci-metrics-collector.service`:
+
+```ini
+[Unit]
+Description=OCI Metrics Collector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opc
+WorkingDirectory=/home/opc/oci-metrics-collector-py
+EnvironmentFile=/home/opc/.env
+ExecStart=/home/opc/oci-metrics-collector-py/venv/bin/oci-metrics-collector collect --config config.yaml --continuous
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now oci-metrics-collector
+sudo systemctl status oci-metrics-collector
+sudo journalctl -u oci-metrics-collector -f
+```
+
+The service runs `--continuous` (5-minute cycles by default), so it's one long-lived process — don't also add a crontab entry.
+
+### Why systemd, not cron / `/loop` / `/schedule`?
+
+- The collector already has a built-in continuous mode with retries, connection pooling, and SIGTERM-based graceful shutdown. systemd gives it auto-restart on crash, auto-start on reboot, and `journalctl` logs for free.
+- A crontab every 5 minutes would spawn a fresh process each cycle — new connection pool, new auth handshake, and risk of overlapping runs.
+- Claude Code's `/loop` needs Claude to stay open in the terminal and is meant for dev-time polling.
+- Claude Code's `/schedule` (triggers) spins up a full agent per run — overkill for calling one CLI.
+
+## Troubleshooting
+
+Issues encountered during real deployments and how to resolve them:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ORA-01017: invalid credential` under systemd, but works interactively | `/home/opc/.env` uses shell `export VAR="..."`; systemd `EnvironmentFile=` ignores `export` and treats quotes literally | Rewrite as plain `KEY=VALUE`, no `export`, no quotes. `chmod 600`. Restart service. |
+| `[Errno -2] Name or service not known` for the ADB hostname | Wallet uses a private endpoint hostname (e.g. `xxx.adb.<region>.oraclecloud.com`) that your VCN's DNS can't resolve | Either wire up a Private View DNS record for the ADB private endpoint in the VCN, or switch `adb.dsn` to the public alias (`<dbname>_public_high`) and allow the instance IP on the ADB ACL. |
+| `ORA-12506: listener refused connection` on the public DSN | ADB Access Control List is blocking the compute instance's egress IP | Add the instance's public/NAT egress IP to the ADB network ACL, or use the private endpoint path. |
+| `ORA-02329: Column of data type TIME/TIMESTAMP WITH TIME ZONE cannot be unique or a primary key` | Legacy DDL used `TIMESTAMP WITH TIME ZONE` in the PK | Already fixed in code — `COLLECTION_TIME` is plain `TIMESTAMP`. Drop any pre-existing table created with the old DDL. |
+| `ORA-12838: cannot read/modify an object after modifying it in parallel` right after table creation | ADB defaults to parallel DML; MERGE immediately after DDL on the same object fails | Already fixed in code — the session issues `ALTER SESSION DISABLE PARALLEL DML` before the MERGE. |
 
 ## Development
 

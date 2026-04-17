@@ -23,13 +23,13 @@ DECLARE
     table_exists NUMBER;
 BEGIN
     SELECT COUNT(*) INTO table_exists
-    FROM user_tables
-    WHERE table_name = :table_name;
+    FROM all_tables
+    WHERE owner = :owner AND table_name = :table_name;
 
     IF table_exists = 0 THEN
         EXECUTE IMMEDIATE '
-            CREATE TABLE {table_name} (
-                COLLECTION_TIME        TIMESTAMP WITH TIME ZONE,
+            CREATE TABLE {full_table_name} (
+                COLLECTION_TIME        TIMESTAMP,
                 INSTANCE_ID            VARCHAR2(255),
                 INSTANCE_NAME          VARCHAR2(255),
                 COMPARTMENT_ID         VARCHAR2(255),
@@ -44,7 +44,7 @@ BEGIN
                 CPU_USAGE_OCPUS        NUMBER,
                 MEMORY_USED_GBS        NUMBER,
                 STATISTIC_TYPE         VARCHAR2(20),
-                CONSTRAINT pk_{table_name} PRIMARY KEY
+                CONSTRAINT pk_{short_table_name} PRIMARY KEY
                     (COLLECTION_TIME, INSTANCE_ID, STATISTIC_TYPE)
             )
         ';
@@ -149,21 +149,32 @@ class AdbWriter:
             )
         return self._pool
 
+    def _parse_table_name(self) -> tuple:
+        """Parse schema.table_name into (owner, table_name, full_name)."""
+        table_name = self._config.adb.table_name
+        if "." in table_name:
+            owner, short_name = table_name.split(".", 1)
+            return owner.upper(), short_name.upper(), table_name
+        return self._config.adb.user.upper(), table_name.upper(), table_name
+
     def _ensure_table(self, connection) -> None:
         """Create the metrics table if it does not exist."""
         if self._table_ensured:
             return
 
-        table_name = self._config.adb.table_name
-        ddl = CREATE_TABLE_DDL.format(table_name=table_name)
+        owner, short_name, full_name = self._parse_table_name()
+        ddl = CREATE_TABLE_DDL.format(
+            full_table_name=full_name,
+            short_table_name=short_name,
+        )
 
         try:
             with connection.cursor() as cursor:
-                cursor.execute(ddl, {"table_name": table_name})
-            logger.info("Ensured table exists: %s", table_name)
+                cursor.execute(ddl, {"owner": owner, "table_name": short_name})
+            logger.info("Ensured table exists: %s", full_name)
             self._table_ensured = True
         except oracledb.DatabaseError as e:
-            logger.error("Failed to ensure table %s: %s", table_name, e)
+            logger.error("Failed to ensure table %s: %s", full_name, e)
             raise
 
     def _record_to_row(self, record: EnrichedMetricRecord) -> dict:
@@ -212,6 +223,7 @@ class AdbWriter:
             rows = [self._record_to_row(r) for r in records]
 
             with connection.cursor() as cursor:
+                cursor.execute("ALTER SESSION DISABLE PARALLEL DML")
                 cursor.executemany(merge_sql, rows)
 
             connection.commit()
