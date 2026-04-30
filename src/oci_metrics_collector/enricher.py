@@ -92,16 +92,44 @@ class EnrichedMetricRecord:
     cpu_allocated_ocpus: Optional[float]
     memory_allocated_gbs: Optional[float]
 
-    # Raw metrics
+    # CPU utilization (one column per statistic; mean kept in original column)
     cpu_utilization_pct: Optional[float] = None
-    memory_utilization_pct: Optional[float] = None
+    cpu_utilization_pct_p99: Optional[float] = None
+    cpu_utilization_pct_p95: Optional[float] = None
+    cpu_utilization_pct_max: Optional[float] = None
 
-    # Derived usage
+    # Memory utilization
+    memory_utilization_pct: Optional[float] = None
+    memory_utilization_pct_p99: Optional[float] = None
+    memory_utilization_pct_p95: Optional[float] = None
+    memory_utilization_pct_max: Optional[float] = None
+
+    # Additional compute-agent metrics
+    load_average_p95: Optional[float] = None
+    memory_allocation_stalls_p95: Optional[float] = None
+
+    # Derived usage (computed from mean values)
     cpu_usage_ocpus: Optional[float] = None
     memory_used_gbs: Optional[float] = None
 
     # Collection metadata
-    statistic_type: str = "mean"
+    statistic_type: str = "aggregate"
+
+
+# (metric_name, statistic) → EnrichedMetricRecord field name.
+# Add entries here when adding new metrics or statistics.
+METRIC_STAT_FIELD_MAP: Dict[tuple, str] = {
+    ("CpuUtilization", "mean"): "cpu_utilization_pct",
+    ("CpuUtilization", "p99"): "cpu_utilization_pct_p99",
+    ("CpuUtilization", "p95"): "cpu_utilization_pct_p95",
+    ("CpuUtilization", "max"): "cpu_utilization_pct_max",
+    ("MemoryUtilization", "mean"): "memory_utilization_pct",
+    ("MemoryUtilization", "p99"): "memory_utilization_pct_p99",
+    ("MemoryUtilization", "p95"): "memory_utilization_pct_p95",
+    ("MemoryUtilization", "max"): "memory_utilization_pct_max",
+    ("LoadAverage", "p95"): "load_average_p95",
+    ("MemoryAllocationStalls", "p95"): "memory_allocation_stalls_p95",
+}
 
 
 class InstanceMetadataCache:
@@ -207,18 +235,26 @@ def enrich_metrics(
     cache = InstanceMetadataCache(config)
     cache.refresh()
 
-    # Group data points by (instance_id, timestamp, statistic)
-    # so we can merge CPU + Memory into one record
+    # Group data points by (instance_id, timestamp) — one wide record per group.
+    # Each datapoint contributes a value to the field its (metric, stat) maps to.
     grouped: Dict[tuple, Dict[str, float]] = {}
     for dp in datapoints:
-        key = (dp.instance_id, dp.timestamp, dp.statistic, dp.compartment_id)
+        field_name = METRIC_STAT_FIELD_MAP.get((dp.metric_name, dp.statistic))
+        if field_name is None:
+            logger.warning(
+                "No EnrichedMetricRecord field mapped for (%s, %s) — dropping datapoint",
+                dp.metric_name,
+                dp.statistic,
+            )
+            continue
+        key = (dp.instance_id, dp.timestamp, dp.compartment_id)
         if key not in grouped:
             grouped[key] = {}
-        grouped[key][dp.metric_name] = dp.value
+        grouped[key][field_name] = dp.value
 
     enriched: List[EnrichedMetricRecord] = []
 
-    for (instance_id, timestamp, statistic, compartment_id), metrics in grouped.items():
+    for (instance_id, timestamp, compartment_id), values in grouped.items():
         meta = cache.get(instance_id)
         if not meta:
             logger.warning(
@@ -226,7 +262,6 @@ def enrich_metrics(
                 "(instance may have been terminated)",
                 instance_id,
             )
-            # Still create a record with partial data
             meta = InstanceMetadata(
                 instance_id=instance_id,
                 display_name="UNKNOWN",
@@ -237,36 +272,32 @@ def enrich_metrics(
                 compartment_id=compartment_id,
             )
 
-        cpu_pct = metrics.get("CpuUtilization")
-        mem_pct = metrics.get("MemoryUtilization")
-
-        # Compute derived usage values
-        cpu_usage = None
-        mem_used = None
-        if cpu_pct is not None and meta.ocpus is not None:
-            cpu_usage = round((cpu_pct / 100.0) * meta.ocpus, 4)
-        if mem_pct is not None and meta.memory_in_gbs is not None:
-            mem_used = round((mem_pct / 100.0) * meta.memory_in_gbs, 4)
-
-        enriched.append(
-            EnrichedMetricRecord(
-                collection_time=timestamp,
-                instance_id=instance_id,
-                instance_name=meta.display_name,
-                compartment_id=meta.compartment_id,
-                availability_domain=meta.availability_domain,
-                fault_domain=meta.fault_domain,
-                shape=meta.shape,
-                lifecycle_state=meta.lifecycle_state,
-                cpu_allocated_ocpus=meta.ocpus,
-                memory_allocated_gbs=meta.memory_in_gbs,
-                cpu_utilization_pct=cpu_pct,
-                memory_utilization_pct=mem_pct,
-                cpu_usage_ocpus=cpu_usage,
-                memory_used_gbs=mem_used,
-                statistic_type=statistic,
-            )
+        record = EnrichedMetricRecord(
+            collection_time=timestamp,
+            instance_id=instance_id,
+            instance_name=meta.display_name,
+            compartment_id=meta.compartment_id,
+            availability_domain=meta.availability_domain,
+            fault_domain=meta.fault_domain,
+            shape=meta.shape,
+            lifecycle_state=meta.lifecycle_state,
+            cpu_allocated_ocpus=meta.ocpus,
+            memory_allocated_gbs=meta.memory_in_gbs,
         )
+        for field_name, value in values.items():
+            setattr(record, field_name, value)
+
+        # Derived usage from the mean values
+        if record.cpu_utilization_pct is not None and meta.ocpus is not None:
+            record.cpu_usage_ocpus = round(
+                (record.cpu_utilization_pct / 100.0) * meta.ocpus, 4
+            )
+        if record.memory_utilization_pct is not None and meta.memory_in_gbs is not None:
+            record.memory_used_gbs = round(
+                (record.memory_utilization_pct / 100.0) * meta.memory_in_gbs, 4
+            )
+
+        enriched.append(record)
 
     logger.info("Enriched %d records from %d data points", len(enriched), len(datapoints))
     return enriched

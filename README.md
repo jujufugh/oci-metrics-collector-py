@@ -36,14 +36,25 @@ Designed as a workaround for environments where **OCI Stack Monitoring is unavai
 
 ## Metrics Collected
 
-| Metric | Source | Description |
+The collector issues one MQL query per `(metric, statistic)` pair listed in `config.metrics.metric_stats` and merges the results into a single wide row per `(instance, timestamp)`.
+
+| Metric | Statistics | Description |
 |---|---|---|
-| `CpuUtilization` | OCI Monitoring | CPU activity as % of total time |
-| `MemoryUtilization` | OCI Monitoring | Used memory as % of total |
+| `CpuUtilization` | mean, p99, p95, max | CPU activity as % of total time |
+| `MemoryUtilization` | mean, p99, p95, max | Used memory as % of total |
+| `LoadAverage` | p95 | OS-level load average |
+| `MemoryAllocationStalls` | p95 | Memory allocation stalls per second |
+
+Plus the following per-instance fields enriched from the Compute API:
+
+| Field | Source | Description |
+|---|---|---|
 | `cpu_allocated_ocpus` | Compute API | OCPUs allocated to the instance |
 | `memory_allocated_gbs` | Compute API | Memory (GB) allocated to the instance |
-| `cpu_usage_ocpus` | Derived | `(CpuUtilization / 100) × cpu_allocated_ocpus` |
-| `memory_used_gbs` | Derived | `(MemoryUtilization / 100) × memory_allocated_gbs` |
+| `cpu_usage_ocpus` | Derived | `(CpuUtilization mean / 100) × cpu_allocated_ocpus` |
+| `memory_used_gbs` | Derived | `(MemoryUtilization mean / 100) × memory_allocated_gbs` |
+
+To add or change `(metric, statistic)` pairs, update **both** `config.yaml` (`metrics.metric_stats`) **and** `enricher.METRIC_STAT_FIELD_MAP` (which maps the pair to a record field / DB column).
 
 ## Prerequisites
 
@@ -162,26 +173,39 @@ The collector auto-creates this table on first run:
 
 ```sql
 CREATE TABLE OCI_COMPUTE_METRICS (
-    COLLECTION_TIME        TIMESTAMP,
-    INSTANCE_ID            VARCHAR2(255),
-    INSTANCE_NAME          VARCHAR2(255),
-    COMPARTMENT_ID         VARCHAR2(255),
-    AVAILABILITY_DOMAIN    VARCHAR2(100),
-    FAULT_DOMAIN           VARCHAR2(100),
-    SHAPE                  VARCHAR2(100),
-    LIFECYCLE_STATE        VARCHAR2(50),
-    CPU_ALLOCATED_OCPUS    NUMBER,
-    MEMORY_ALLOCATED_GBS   NUMBER,
-    CPU_UTILIZATION_PCT    NUMBER,
-    MEMORY_UTILIZATION_PCT NUMBER,
-    CPU_USAGE_OCPUS        NUMBER,
-    MEMORY_USED_GBS        NUMBER,
-    STATISTIC_TYPE         VARCHAR2(20),
+    COLLECTION_TIME              TIMESTAMP,
+    INSTANCE_ID                  VARCHAR2(255),
+    INSTANCE_NAME                VARCHAR2(255),
+    COMPARTMENT_ID               VARCHAR2(255),
+    AVAILABILITY_DOMAIN          VARCHAR2(100),
+    FAULT_DOMAIN                 VARCHAR2(100),
+    SHAPE                        VARCHAR2(100),
+    LIFECYCLE_STATE              VARCHAR2(50),
+    CPU_ALLOCATED_OCPUS          NUMBER,
+    MEMORY_ALLOCATED_GBS         NUMBER,
+    CPU_UTILIZATION_PCT          NUMBER,   -- mean
+    CPU_UTILIZATION_PCT_P99      NUMBER,
+    CPU_UTILIZATION_PCT_P95      NUMBER,
+    CPU_UTILIZATION_PCT_MAX      NUMBER,
+    MEMORY_UTILIZATION_PCT       NUMBER,   -- mean
+    MEMORY_UTILIZATION_PCT_P99   NUMBER,
+    MEMORY_UTILIZATION_PCT_P95   NUMBER,
+    MEMORY_UTILIZATION_PCT_MAX   NUMBER,
+    LOAD_AVERAGE_P95             NUMBER,
+    MEMORY_ALLOCATION_STALLS_P95 NUMBER,
+    CPU_USAGE_OCPUS              NUMBER,
+    MEMORY_USED_GBS              NUMBER,
+    STATISTIC_TYPE               VARCHAR2(20),
     PRIMARY KEY (COLLECTION_TIME, INSTANCE_ID, STATISTIC_TYPE)
 );
 ```
 
-`COLLECTION_TIME` is plain `TIMESTAMP` (not `TIMESTAMP WITH TIME ZONE`) because Oracle ADB doesn't allow timezone-aware timestamps in a primary key (ORA-02329). Values are stored as UTC.
+Notes on the schema:
+
+- `COLLECTION_TIME` is plain `TIMESTAMP` (not `TIMESTAMP WITH TIME ZONE`) because Oracle ADB doesn't allow timezone-aware timestamps in a primary key (ORA-02329). Values are stored as UTC.
+- One row per `(instance, timestamp)` holds **all** statistics — the percentile / max columns are populated alongside the mean. The plain `CPU_UTILIZATION_PCT` and `MEMORY_UTILIZATION_PCT` columns hold the **mean** (kept for backward compatibility with older collectors).
+- New rows are written with `STATISTIC_TYPE = 'aggregate'`. Pre-existing rows from older versions of this collector keep their original `STATISTIC_TYPE` value (e.g. `'mean'`) and have `NULL` in the new percentile / max columns. The PK is unchanged.
+- On startup, the writer queries `all_tab_columns` and runs `ALTER TABLE ADD` for any of the extended NUMBER columns (`*_P99`, `*_P95`, `*_MAX`, `LOAD_AVERAGE_P95`, `MEMORY_ALLOCATION_STALLS_P95`) that are missing — historical data is preserved with `NULL`s in the new columns.
 
 ### Writing to a different schema (e.g. `OCIRA_DEV`)
 

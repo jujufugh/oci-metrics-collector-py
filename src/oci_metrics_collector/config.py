@@ -35,11 +35,13 @@ class ScopeConfig:
 class MetricsConfig:
     """Metrics collection parameters."""
     namespace: str = "oci_computeagent"
-    metric_names: List[str] = field(
-        default_factory=lambda: ["CpuUtilization", "MemoryUtilization"]
+    metric_stats: Dict[str, List[str]] = field(
+        default_factory=lambda: {
+            "CpuUtilization": ["mean"],
+            "MemoryUtilization": ["mean"],
+        }
     )
     resolution: str = "5m"
-    statistic: str = "mean"
     lookback_minutes: int = 10
 
 

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from oci_metrics_collector.collector import MetricDataPoint, collect_metrics
+from oci_metrics_collector.collector import MetricDataPoint, _stat_to_mql, collect_metrics
 from oci_metrics_collector.config import CollectorConfig, MetricsConfig, OciAuthConfig, ScopeConfig
 
 
@@ -19,12 +19,32 @@ def config():
         scope=ScopeConfig(compartment_id="ocid1.compartment.oc1..test"),
         metrics=MetricsConfig(
             namespace="oci_computeagent",
-            metric_names=["CpuUtilization", "MemoryUtilization"],
+            metric_stats={
+                "CpuUtilization": ["mean"],
+                "MemoryUtilization": ["mean"],
+            },
             resolution="5m",
-            statistic="mean",
             lookback_minutes=10,
         ),
     )
+
+
+class TestStatToMql:
+    """Tests for the MQL statistic mapping."""
+
+    def test_simple_aggregations(self):
+        assert _stat_to_mql("mean") == "mean()"
+        assert _stat_to_mql("max") == "max()"
+        assert _stat_to_mql("min") == "min()"
+
+    def test_percentiles(self):
+        assert _stat_to_mql("p99") == "percentile(.99)"
+        assert _stat_to_mql("p95") == "percentile(.95)"
+        assert _stat_to_mql("p90") == "percentile(.90)"
+
+    def test_unknown_raises(self):
+        with pytest.raises(ValueError):
+            _stat_to_mql("median")
 
 
 class TestMetricDataPoint:

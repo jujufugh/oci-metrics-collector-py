@@ -34,18 +34,18 @@ metrics:
   # Namespace for compute instance metrics
   namespace: "oci_computeagent"
 
-  # Metrics to collect (from oci_computeagent namespace)
-  # Available: CpuUtilization, MemoryUtilization, DiskBytesRead,
-  #            DiskBytesWritten, NetworkBytesIn, NetworkBytesOut
-  metric_names:
-    - "CpuUtilization"
-    - "MemoryUtilization"
+  # One MQL query per (metric, statistic). Supported statistics: mean, max,
+  # min, sum, count, rate, and percentiles p99/p95/p90 (mapped to MQL
+  # percentile()). Only the (metric, stat) pairs registered in
+  # enricher.METRIC_STAT_FIELD_MAP land in named columns; the rest are dropped.
+  metric_stats:
+    CpuUtilization:          ["mean", "p99", "p95", "max"]
+    MemoryUtilization:       ["mean", "p99", "p95", "max"]
+    LoadAverage:             ["p95"]
+    MemoryAllocationStalls:  ["p95"]
 
   # MQL resolution interval (e.g., "1m", "5m", "1h")
   resolution: "5m"
-
-  # Statistic to apply: mean, max, min, sum, p50, p90, p95, p99
-  statistic: "mean"
 
   # How far back to look for data (in minutes) for each collection cycle
   lookback_minutes: 10
