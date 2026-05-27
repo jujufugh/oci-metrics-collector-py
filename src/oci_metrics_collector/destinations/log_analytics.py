@@ -52,6 +52,9 @@ class LogAnalyticsWriter:
             "collection_time": record.collection_time.isoformat()
             if record.collection_time
             else None,
+            "source_tenancy_name": record.source_tenancy_name,
+            "source_tenancy_id": record.source_tenancy_id,
+            "region": record.region,
             "instance_id": record.instance_id,
             "instance_name": record.instance_name,
             "compartment_id": record.compartment_id,

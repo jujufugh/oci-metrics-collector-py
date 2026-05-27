@@ -13,8 +13,8 @@ from typing import Dict, List, Optional, Set
 
 import oci
 
-from .collector import MetricDataPoint, _build_oci_config
-from .config import CollectorConfig
+from .collector import MetricDataPoint, _build_oci_config, _set_client_region
+from .config import CollectorConfig, CollectionScope, iter_collection_scopes
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,9 @@ FIXED_SHAPE_SPECS: Dict[str, tuple] = {
 @dataclass
 class InstanceMetadata:
     """Cached metadata for a single compute instance."""
+    source_tenancy_name: str
+    source_tenancy_id: str
+    region: str
     instance_id: str
     display_name: str
     shape: str
@@ -78,6 +81,11 @@ class EnrichedMetricRecord:
     """A metric data point enriched with instance metadata and derived fields."""
     # Timing
     collection_time: datetime
+
+    # Source scope
+    source_tenancy_name: str
+    source_tenancy_id: str
+    region: str
 
     # Instance identity
     instance_id: str
@@ -143,46 +151,54 @@ class InstanceMetadataCache:
     def __init__(self, config: CollectorConfig):
         self._config = config
         self._cache: Dict[str, InstanceMetadata] = {}
-        self._client = self._create_compute_client()
-        self._identity_client = None
 
-    def _create_compute_client(self):
+    def _create_compute_client(self, region: str):
         """Create an OCI ComputeClient with the appropriate auth."""
-        oci_config, signer = _build_oci_config(self._config)
+        oci_config, signer = _build_oci_config(self._config, region=region)
         if signer:
-            return oci.core.ComputeClient(config={}, signer=signer)
-        return oci.core.ComputeClient(oci_config)
+            return _set_client_region(
+                oci.core.ComputeClient(config={}, signer=signer),
+                region,
+            )
+        return _set_client_region(oci.core.ComputeClient(oci_config), region)
 
-    def _create_identity_client(self):
+    def _create_identity_client(self, region: str):
         """Create an OCI IdentityClient with the appropriate auth."""
-        oci_config, signer = _build_oci_config(self._config)
+        oci_config, signer = _build_oci_config(self._config, region=region)
         if signer:
-            return oci.identity.IdentityClient(config={}, signer=signer)
-        return oci.identity.IdentityClient(oci_config)
+            return _set_client_region(
+                oci.identity.IdentityClient(config={}, signer=signer),
+                region,
+            )
+        return _set_client_region(oci.identity.IdentityClient(oci_config), region)
 
-    def _get_instance_compartment_ids(self) -> List[str]:
+    def _get_instance_compartment_ids(
+        self,
+        scope: CollectionScope,
+        identity_client,
+    ) -> List[str]:
         """Return the compartments whose instances should be cached."""
-        compartment_id = self._config.scope.compartment_id
-        if not self._config.scope.compartment_id_in_subtree:
-            return [compartment_id]
+        if not scope.compartment_id_in_subtree:
+            return [scope.compartment_id]
 
-        if self._identity_client is None:
-            self._identity_client = self._create_identity_client()
-
-        logger.info("Listing active compartments under tenancy: %s", compartment_id)
+        logger.info(
+            "Listing active compartments under tenancy %s in %s",
+            scope.source_tenancy_name,
+            scope.region,
+        )
         compartments = oci.pagination.list_call_get_all_results(
-            self._identity_client.list_compartments,
-            compartment_id=compartment_id,
+            identity_client.list_compartments,
+            compartment_id=scope.compartment_id,
             compartment_id_in_subtree=True,
             access_level="ACCESSIBLE",
             lifecycle_state="ACTIVE",
         ).data
 
-        compartment_ids: Set[str] = {compartment_id}
+        compartment_ids: Set[str] = {scope.compartment_id}
         compartment_ids.update(comp.id for comp in compartments)
         return sorted(compartment_ids)
 
-    def _cache_instance(self, inst) -> None:
+    def _cache_instance(self, scope: CollectionScope, inst) -> None:
         """Cache one OCI compute instance response object."""
         if inst.lifecycle_state == "TERMINATED":
             return
@@ -209,6 +225,9 @@ class InstanceMetadataCache:
                 )
 
         self._cache[inst.id] = InstanceMetadata(
+            source_tenancy_name=scope.source_tenancy_name,
+            source_tenancy_id=scope.source_tenancy_id,
+            region=scope.region,
             instance_id=inst.id,
             display_name=inst.display_name,
             shape=inst.shape,
@@ -226,30 +245,47 @@ class InstanceMetadataCache:
         in the configured compartment or tenancy subtree.
         """
         self._cache.clear()
-        compartment_ids = self._get_instance_compartment_ids()
-        logger.info(
-            "Refreshing instance metadata from %d compartment(s)",
-            len(compartment_ids),
-        )
+        for scope in iter_collection_scopes(self._config):
+            compute_client = self._create_compute_client(scope.region)
+            identity_client = self._create_identity_client(scope.region)
+            compartment_ids = self._get_instance_compartment_ids(
+                scope,
+                identity_client,
+            )
+            logger.info(
+                "Refreshing instance metadata from %d compartment(s) "
+                "(tenancy=%s, region=%s)",
+                len(compartment_ids),
+                scope.source_tenancy_name,
+                scope.region,
+            )
 
-        for compartment_id in compartment_ids:
-            logger.debug("Listing instances in compartment: %s", compartment_id)
-            try:
-                instances = oci.pagination.list_call_get_all_results(
-                    self._client.list_instances,
-                    compartment_id=compartment_id,
-                ).data
-            except oci.exceptions.ServiceError as e:
-                logger.warning(
-                    "Failed to list instances in compartment %s: %s (status=%d)",
+            for compartment_id in compartment_ids:
+                logger.debug(
+                    "Listing instances in compartment %s (tenancy=%s, region=%s)",
                     compartment_id,
-                    e.message,
-                    e.status,
+                    scope.source_tenancy_name,
+                    scope.region,
                 )
-                continue
+                try:
+                    instances = oci.pagination.list_call_get_all_results(
+                        compute_client.list_instances,
+                        compartment_id=compartment_id,
+                    ).data
+                except oci.exceptions.ServiceError as e:
+                    logger.warning(
+                        "Failed to list instances in compartment %s "
+                        "(tenancy=%s, region=%s): %s (status=%d)",
+                        compartment_id,
+                        scope.source_tenancy_name,
+                        scope.region,
+                        e.message,
+                        e.status,
+                    )
+                    continue
 
-            for inst in instances:
-                self._cache_instance(inst)
+                for inst in instances:
+                    self._cache_instance(scope, inst)
 
         logger.info("Cached metadata for %d instances", len(self._cache))
 
@@ -292,14 +328,28 @@ def enrich_metrics(
                 dp.statistic,
             )
             continue
-        key = (dp.instance_id, dp.timestamp, dp.compartment_id)
+        key = (
+            dp.source_tenancy_name,
+            dp.source_tenancy_id,
+            dp.region,
+            dp.instance_id,
+            dp.timestamp,
+            dp.compartment_id,
+        )
         if key not in grouped:
             grouped[key] = {}
         grouped[key][field_name] = dp.value
 
     enriched: List[EnrichedMetricRecord] = []
 
-    for (instance_id, timestamp, compartment_id), values in grouped.items():
+    for (
+        source_tenancy_name,
+        source_tenancy_id,
+        region,
+        instance_id,
+        timestamp,
+        compartment_id,
+    ), values in grouped.items():
         meta = cache.get(instance_id)
         if not meta:
             logger.warning(
@@ -308,6 +358,9 @@ def enrich_metrics(
                 instance_id,
             )
             meta = InstanceMetadata(
+                source_tenancy_name=source_tenancy_name,
+                source_tenancy_id=source_tenancy_id,
+                region=region,
                 instance_id=instance_id,
                 display_name="UNKNOWN",
                 shape="UNKNOWN",
@@ -319,6 +372,9 @@ def enrich_metrics(
 
         record = EnrichedMetricRecord(
             collection_time=timestamp,
+            source_tenancy_name=meta.source_tenancy_name,
+            source_tenancy_id=meta.source_tenancy_id,
+            region=meta.region,
             instance_id=instance_id,
             instance_name=meta.display_name,
             compartment_id=meta.compartment_id,

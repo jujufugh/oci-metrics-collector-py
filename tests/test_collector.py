@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from oci_metrics_collector.collector import MetricDataPoint, _stat_to_mql, collect_metrics
-from oci_metrics_collector.config import CollectorConfig, MetricsConfig, OciAuthConfig, ScopeConfig
+from oci_metrics_collector.config import CollectorConfig, MetricsConfig, OciAuthConfig, TenancyConfig
 
 
 @pytest.fixture
@@ -16,7 +16,13 @@ def config():
     """Build a minimal test config."""
     return CollectorConfig(
         oci=OciAuthConfig(auth_method="config_file"),
-        scope=ScopeConfig(compartment_id="ocid1.compartment.oc1..test"),
+        tenancies=[
+            TenancyConfig(
+                name="parent",
+                tenancy_id="ocid1.tenancy.oc1..test",
+                regions=["us-ashburn-1"],
+            )
+        ],
         metrics=MetricsConfig(
             namespace="oci_computeagent",
             metric_stats={
@@ -52,6 +58,9 @@ class TestMetricDataPoint:
 
     def test_create_datapoint(self):
         dp = MetricDataPoint(
+            source_tenancy_name="parent",
+            source_tenancy_id="ocid1.tenancy.oc1..test",
+            region="us-ashburn-1",
             instance_id="ocid1.instance.oc1..test",
             metric_name="CpuUtilization",
             timestamp=datetime(2026, 4, 13, 10, 0, 0, tzinfo=timezone.utc),
@@ -65,6 +74,9 @@ class TestMetricDataPoint:
 
     def test_datapoint_equality(self):
         kwargs = dict(
+            source_tenancy_name="parent",
+            source_tenancy_id="ocid1.tenancy.oc1..test",
+            region="us-ashburn-1",
             instance_id="ocid1.instance.oc1..test",
             metric_name="CpuUtilization",
             timestamp=datetime(2026, 4, 13, 10, 0, 0, tzinfo=timezone.utc),
@@ -106,14 +118,12 @@ class TestCollectMetrics:
         assert result[0].value == 45.5
 
     @patch("oci_metrics_collector.collector._create_monitoring_client")
-    def test_collect_uses_subtree_scope_and_metric_compartment(
+    def test_collect_uses_tenancy_region_scope_and_metric_compartment(
         self,
         mock_create_client,
         config,
     ):
-        """Subtree collection passes the OCI flag and keeps metric compartment IDs."""
-        config.scope.compartment_id = "ocid1.tenancy.oc1..test"
-        config.scope.compartment_id_in_subtree = True
+        """Collection passes OCI subtree scope and keeps metric compartment IDs."""
 
         mock_dp = MagicMock()
         mock_dp.timestamp = datetime(2026, 4, 13, 10, 0, 0, tzinfo=timezone.utc)
@@ -134,6 +144,10 @@ class TestCollectMetrics:
         result = collect_metrics(config)
 
         assert result[0].compartment_id == "ocid1.compartment.oc1..child"
+        assert result[0].source_tenancy_name == "parent"
+        assert result[0].source_tenancy_id == "ocid1.tenancy.oc1..test"
+        assert result[0].region == "us-ashburn-1"
+        mock_create_client.assert_called_with(config, region="us-ashburn-1")
         first_call = mock_client.summarize_metrics_data.call_args
         assert first_call.kwargs["compartment_id"] == "ocid1.tenancy.oc1..test"
         assert first_call.kwargs["compartment_id_in_subtree"] is True

@@ -11,8 +11,8 @@ import logging
 import sys
 
 from . import __version__
-from .collector import _build_oci_config, _create_monitoring_client
-from .config import load_config
+from .collector import _create_monitoring_client
+from .config import iter_collection_scopes, load_config
 from .orchestrator import MetricsOrchestrator
 
 
@@ -79,61 +79,73 @@ def cmd_test_connection(args) -> None:
 
 
 def cmd_discover(args) -> None:
-    """Discover available metrics in the target compartment or tenancy subtree."""
+    """Discover available metrics in configured tenancy-region scopes."""
     config = load_config(args.config)
     _setup_logging(config.orchestration.log_level)
 
     import oci
 
-    client = _create_monitoring_client(config)
-    compartment_id = config.scope.compartment_id
-    compartment_id_in_subtree = config.scope.compartment_id_in_subtree
-
-    scope_label = "tenancy subtree" if compartment_id_in_subtree else "compartment"
-    print(f"\nDiscovering metrics in {scope_label}: {compartment_id}")
+    scopes = list(iter_collection_scopes(config))
+    print(f"\nDiscovering metrics in {len(scopes)} tenancy-region scope(s)")
     print(f"Namespace filter: {args.namespace or 'all'}\n")
 
     list_details = oci.monitoring.models.ListMetricsDetails(
         namespace=args.namespace,
     )
 
-    try:
-        response = oci.pagination.list_call_get_all_results(
-            client.list_metrics,
-            compartment_id=compartment_id,
-            list_metrics_details=list_details,
-            compartment_id_in_subtree=compartment_id_in_subtree,
-        )
-    except oci.exceptions.ServiceError as e:
-        print(f"Error: {e.message} (status={e.status})", file=sys.stderr)
-        sys.exit(1)
-
-    # Group by namespace + metric name
     metrics_map = {}
-    for m in response.data:
-        key = (m.namespace, m.name)
-        if key not in metrics_map:
-            metrics_map[key] = {
-                "namespace": m.namespace,
-                "name": m.name,
-                "dimensions": set(),
-                "resource_count": 0,
-            }
-        metrics_map[key]["resource_count"] += 1
-        for dim_key in (m.dimensions or {}).keys():
-            metrics_map[key]["dimensions"].add(dim_key)
+    for scope in scopes:
+        client = _create_monitoring_client(config, region=scope.region)
+        try:
+            response = oci.pagination.list_call_get_all_results(
+                client.list_metrics,
+                compartment_id=scope.compartment_id,
+                list_metrics_details=list_details,
+                compartment_id_in_subtree=scope.compartment_id_in_subtree,
+            )
+        except oci.exceptions.ServiceError as e:
+            print(
+                f"Error in {scope.source_tenancy_name}/{scope.region}: "
+                f"{e.message} (status={e.status})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        for m in response.data:
+            key = (
+                scope.source_tenancy_name,
+                scope.region,
+                m.namespace,
+                m.name,
+            )
+            if key not in metrics_map:
+                metrics_map[key] = {
+                    "tenancy": scope.source_tenancy_name,
+                    "region": scope.region,
+                    "namespace": m.namespace,
+                    "name": m.name,
+                    "dimensions": set(),
+                    "resource_count": 0,
+                }
+            metrics_map[key]["resource_count"] += 1
+            for dim_key in (m.dimensions or {}).keys():
+                metrics_map[key]["dimensions"].add(dim_key)
 
     if not metrics_map:
         print("No metrics found.")
         return
 
-    print(f"{'Namespace':<30} {'Metric Name':<25} {'Resources':<10} Dimensions")
-    print("-" * 100)
+    print(
+        f"{'Tenancy':<20} {'Region':<18} {'Namespace':<30} "
+        f"{'Metric Name':<25} {'Resources':<10} Dimensions"
+    )
+    print("-" * 140)
 
     for key in sorted(metrics_map.keys()):
         info = metrics_map[key]
         dims = ", ".join(sorted(info["dimensions"]))
         print(
+            f"{info['tenancy']:<20} {info['region']:<18} "
             f"{info['namespace']:<30} {info['name']:<25} "
             f"{info['resource_count']:<10} {dims}"
         )
@@ -202,7 +214,7 @@ def main() -> None:
     # --- discover ---
     discover_parser = subparsers.add_parser(
         "discover",
-        help="Discover available metrics in the target compartment",
+        help="Discover available metrics in configured tenancy-region scopes",
     )
     discover_parser.add_argument(
         "--config",

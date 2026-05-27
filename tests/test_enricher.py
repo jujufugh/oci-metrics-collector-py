@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from oci_metrics_collector.collector import MetricDataPoint
-from oci_metrics_collector.config import CollectorConfig, MetricsConfig, OciAuthConfig, ScopeConfig
+from oci_metrics_collector.config import CollectorConfig, MetricsConfig, OciAuthConfig, TenancyConfig
 from oci_metrics_collector.enricher import (
     FIXED_SHAPE_SPECS,
     EnrichedMetricRecord,
@@ -22,7 +22,13 @@ def config():
     """Build a minimal test config."""
     return CollectorConfig(
         oci=OciAuthConfig(auth_method="config_file"),
-        scope=ScopeConfig(compartment_id="ocid1.compartment.oc1..test"),
+        tenancies=[
+            TenancyConfig(
+                name="parent",
+                tenancy_id="ocid1.tenancy.oc1..test",
+                regions=["us-ashburn-1"],
+            )
+        ],
         metrics=MetricsConfig(),
     )
 
@@ -30,6 +36,9 @@ def config():
 def _make_datapoint(instance_id, metric_name, value, ts=None):
     """Helper to create a MetricDataPoint."""
     return MetricDataPoint(
+        source_tenancy_name="parent",
+        source_tenancy_id="ocid1.tenancy.oc1..test",
+        region="us-ashburn-1",
         instance_id=instance_id,
         metric_name=metric_name,
         timestamp=ts or datetime(2026, 4, 13, 10, 0, 0, tzinfo=timezone.utc),
@@ -90,6 +99,9 @@ class TestEnrichMetrics:
         # Setup mock cache
         mock_cache = MagicMock()
         mock_meta = MagicMock()
+        mock_meta.source_tenancy_name = "parent"
+        mock_meta.source_tenancy_id = "ocid1.tenancy.oc1..test"
+        mock_meta.region = "us-ashburn-1"
         mock_meta.display_name = "web-server-01"
         mock_meta.shape = "VM.Standard.E4.Flex"
         mock_meta.lifecycle_state = "RUNNING"
@@ -142,6 +154,9 @@ class TestEnrichMetrics:
         """Test that CPU and Memory for the same instance+timestamp merge."""
         mock_cache = MagicMock()
         mock_meta = MagicMock()
+        mock_meta.source_tenancy_name = "parent"
+        mock_meta.source_tenancy_id = "ocid1.tenancy.oc1..test"
+        mock_meta.region = "us-ashburn-1"
         mock_meta.display_name = "db-server-01"
         mock_meta.shape = "VM.Standard2.4"
         mock_meta.lifecycle_state = "RUNNING"
@@ -232,15 +247,20 @@ class TestInstanceMetadataCache:
         cache = InstanceMetadataCache(
             CollectorConfig(
                 oci=OciAuthConfig(auth_method="config_file"),
-                scope=ScopeConfig(
-                    compartment_id="ocid1.tenancy.oc1..test",
-                    compartment_id_in_subtree=True,
-                ),
+                tenancies=[
+                    TenancyConfig(
+                        name="parent",
+                        tenancy_id="ocid1.tenancy.oc1..test",
+                        regions=["us-ashburn-1"],
+                    )
+                ],
             )
         )
         cache.refresh()
 
         assert cache.get("ocid1.instance.oc1..root").display_name == "root-instance"
+        assert cache.get("ocid1.instance.oc1..root").source_tenancy_name == "parent"
+        assert cache.get("ocid1.instance.oc1..root").region == "us-ashburn-1"
         assert cache.get("ocid1.instance.oc1..child1").compartment_id == (
             "ocid1.compartment.oc1..child1"
         )

@@ -31,6 +31,12 @@ EXTENDED_NUMBER_COLUMNS = [
     "MEMORY_ALLOCATION_STALLS_P95",
 ]
 
+EXTENDED_VARCHAR_COLUMNS = {
+    "SOURCE_TENANCY_NAME": "VARCHAR2(255)",
+    "SOURCE_TENANCY_ID": "VARCHAR2(255)",
+    "REGION": "VARCHAR2(100)",
+}
+
 # ---------------------------------------------------------------------------
 # DDL — Auto-create the target table if it does not exist.
 # ---------------------------------------------------------------------------
@@ -46,6 +52,9 @@ BEGIN
         EXECUTE IMMEDIATE '
             CREATE TABLE {full_table_name} (
                 COLLECTION_TIME              TIMESTAMP,
+                SOURCE_TENANCY_NAME          VARCHAR2(255),
+                SOURCE_TENANCY_ID            VARCHAR2(255),
+                REGION                       VARCHAR2(100),
                 INSTANCE_ID                  VARCHAR2(255),
                 INSTANCE_NAME                VARCHAR2(255),
                 COMPARTMENT_ID               VARCHAR2(255),
@@ -84,6 +93,9 @@ MERGE INTO {table_name} tgt
 USING (
     SELECT
         :collection_time                  AS collection_time,
+        :source_tenancy_name              AS source_tenancy_name,
+        :source_tenancy_id                AS source_tenancy_id,
+        :region                           AS region,
         :instance_id                      AS instance_id,
         :instance_name                    AS instance_name,
         :compartment_id                   AS compartment_id,
@@ -114,6 +126,9 @@ ON (
     AND tgt.STATISTIC_TYPE = src.statistic_type
 )
 WHEN MATCHED THEN UPDATE SET
+    tgt.SOURCE_TENANCY_NAME          = src.source_tenancy_name,
+    tgt.SOURCE_TENANCY_ID            = src.source_tenancy_id,
+    tgt.REGION                       = src.region,
     tgt.INSTANCE_NAME                = src.instance_name,
     tgt.COMPARTMENT_ID               = src.compartment_id,
     tgt.AVAILABILITY_DOMAIN          = src.availability_domain,
@@ -135,7 +150,8 @@ WHEN MATCHED THEN UPDATE SET
     tgt.CPU_USAGE_OCPUS              = src.cpu_usage_ocpus,
     tgt.MEMORY_USED_GBS              = src.memory_used_gbs
 WHEN NOT MATCHED THEN INSERT (
-    COLLECTION_TIME, INSTANCE_ID, INSTANCE_NAME,
+    COLLECTION_TIME, SOURCE_TENANCY_NAME, SOURCE_TENANCY_ID, REGION,
+    INSTANCE_ID, INSTANCE_NAME,
     COMPARTMENT_ID, AVAILABILITY_DOMAIN, FAULT_DOMAIN,
     SHAPE, LIFECYCLE_STATE,
     CPU_ALLOCATED_OCPUS, MEMORY_ALLOCATED_GBS,
@@ -147,7 +163,8 @@ WHEN NOT MATCHED THEN INSERT (
     CPU_USAGE_OCPUS, MEMORY_USED_GBS,
     STATISTIC_TYPE
 ) VALUES (
-    src.collection_time, src.instance_id, src.instance_name,
+    src.collection_time, src.source_tenancy_name, src.source_tenancy_id, src.region,
+    src.instance_id, src.instance_name,
     src.compartment_id, src.availability_domain, src.fault_domain,
     src.shape, src.lifecycle_state,
     src.cpu_allocated_ocpus, src.memory_allocated_gbs,
@@ -226,8 +243,14 @@ class AdbWriter:
             logger.error("Failed to ensure table %s: %s", full_name, e)
             raise
 
-    def _migrate_columns(self, cursor, owner: str, short_name: str, full_name: str) -> None:
-        """ALTER TABLE ADD any extended NUMBER columns missing from an existing table."""
+    def _migrate_columns(
+        self,
+        cursor,
+        owner: str,
+        short_name: str,
+        full_name: str,
+    ) -> None:
+        """ALTER TABLE ADD any columns missing from an existing table."""
         cursor.execute(
             """
             SELECT column_name FROM all_tab_columns
@@ -236,10 +259,16 @@ class AdbWriter:
             {"owner": owner, "table_name": short_name},
         )
         existing = {row[0] for row in cursor.fetchall()}
-        missing = [c for c in EXTENDED_NUMBER_COLUMNS if c not in existing]
+        column_defs = {c: "NUMBER" for c in EXTENDED_NUMBER_COLUMNS}
+        column_defs.update(EXTENDED_VARCHAR_COLUMNS)
+        missing = [c for c in column_defs if c not in existing]
         if not missing:
             return
-        ddl = f"ALTER TABLE {full_name} ADD (" + ", ".join(f"{c} NUMBER" for c in missing) + ")"
+        ddl = (
+            f"ALTER TABLE {full_name} ADD ("
+            + ", ".join(f"{c} {column_defs[c]}" for c in missing)
+            + ")"
+        )
         cursor.execute(ddl)
         logger.info("Added %d new column(s) to %s: %s", len(missing), full_name, missing)
 
@@ -247,6 +276,9 @@ class AdbWriter:
         """Convert an EnrichedMetricRecord to a dict for bind variables."""
         return {
             "collection_time": record.collection_time,
+            "source_tenancy_name": record.source_tenancy_name,
+            "source_tenancy_id": record.source_tenancy_id,
+            "region": record.region,
             "instance_id": record.instance_id,
             "instance_name": record.instance_name,
             "compartment_id": record.compartment_id,
