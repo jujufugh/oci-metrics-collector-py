@@ -13,8 +13,9 @@ from oci_metrics_collector.config import (
     CollectorConfig,
     LogAnalyticsConfig,
     OciAuthConfig,
-    ScopeConfig,
+    TenancyConfig,
 )
+from oci_metrics_collector.destinations.adb import AdbWriter
 from oci_metrics_collector.destinations.log_analytics import LogAnalyticsWriter
 from oci_metrics_collector.enricher import EnrichedMetricRecord
 
@@ -30,6 +31,9 @@ def _make_record(
     """Create a sample EnrichedMetricRecord."""
     return EnrichedMetricRecord(
         collection_time=datetime(2026, 4, 13, 10, 0, 0, tzinfo=timezone.utc),
+        source_tenancy_name="parent",
+        source_tenancy_id="ocid1.tenancy.oc1..test",
+        region="us-ashburn-1",
         instance_id=instance_id,
         instance_name=instance_name,
         compartment_id="ocid1.compartment.oc1..test",
@@ -54,7 +58,13 @@ class TestLogAnalyticsPayloadFormat:
     def config(self):
         return CollectorConfig(
             oci=OciAuthConfig(auth_method="config_file"),
-            scope=ScopeConfig(compartment_id="ocid1.compartment.oc1..test"),
+            tenancies=[
+                TenancyConfig(
+                    name="parent",
+                    tenancy_id="ocid1.tenancy.oc1..test",
+                    regions=["us-ashburn-1"],
+                )
+            ],
             log_analytics=LogAnalyticsConfig(
                 enabled=True,
                 namespace="test_ns",
@@ -101,6 +111,9 @@ class TestLogAnalyticsPayloadFormat:
         # Verify log record is valid JSON
         log_line = json.loads(event["logRecords"][0])
         assert log_line["instance_name"] == "web-server-01"
+        assert log_line["source_tenancy_name"] == "parent"
+        assert log_line["source_tenancy_id"] == "ocid1.tenancy.oc1..test"
+        assert log_line["region"] == "us-ashburn-1"
         assert log_line["cpu_utilization_pct"] == 45.2
         assert log_line["memory_utilization_pct"] == 72.8
 
@@ -149,11 +162,60 @@ class TestLogAnalyticsPayloadFormat:
 class TestAdbRecordConversion:
     """Test the ADB record-to-row conversion."""
 
+    def test_migrate_columns_adds_source_metadata_without_key_change(self):
+        """Conservative migration adds columns only, not PK/unique constraints."""
+        writer = AdbWriter(CollectorConfig(adb=AdbConfig(enabled=True)))
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [
+            ("COLLECTION_TIME",),
+            ("INSTANCE_ID",),
+            ("STATISTIC_TYPE",),
+        ]
+
+        writer._migrate_columns(
+            cursor,
+            owner="ADMIN",
+            short_name="OCI_COMPUTE_METRICS",
+            full_name="OCI_COMPUTE_METRICS",
+        )
+
+        ddl = cursor.execute.call_args_list[-1].args[0]
+        assert "ALTER TABLE OCI_COMPUTE_METRICS ADD" in ddl
+        assert "SOURCE_TENANCY_NAME VARCHAR2(255)" in ddl
+        assert "SOURCE_TENANCY_ID VARCHAR2(255)" in ddl
+        assert "REGION VARCHAR2(100)" in ddl
+        assert "PRIMARY KEY" not in ddl
+        assert "UNIQUE" not in ddl
+
+    def test_adb_row_includes_source_metadata(self):
+        """Verify source tenancy and region are bound for ADB writes."""
+        writer = AdbWriter(
+            CollectorConfig(
+                adb=AdbConfig(enabled=True),
+                tenancies=[
+                    TenancyConfig(
+                        name="parent",
+                        tenancy_id="ocid1.tenancy.oc1..test",
+                        regions=["us-ashburn-1"],
+                    )
+                ],
+            )
+        )
+
+        row = writer._record_to_row(_make_record())
+
+        assert row["source_tenancy_name"] == "parent"
+        assert row["source_tenancy_id"] == "ocid1.tenancy.oc1..test"
+        assert row["region"] == "us-ashburn-1"
+
     def test_record_fields(self):
         """Verify all expected fields are present in the record."""
         record = _make_record()
         assert record.collection_time is not None
         assert record.instance_id == "ocid1.instance.oc1..inst1"
+        assert record.source_tenancy_name == "parent"
+        assert record.source_tenancy_id == "ocid1.tenancy.oc1..test"
+        assert record.region == "us-ashburn-1"
         assert record.cpu_allocated_ocpus == 4.0
         assert record.memory_allocated_gbs == 64.0
         assert record.cpu_utilization_pct == 45.2
@@ -166,6 +228,9 @@ class TestAdbRecordConversion:
         """Verify record handles None derived values."""
         record = EnrichedMetricRecord(
             collection_time=datetime(2026, 4, 13, tzinfo=timezone.utc),
+            source_tenancy_name="parent",
+            source_tenancy_id="ocid1.tenancy.oc1..test",
+            region="us-ashburn-1",
             instance_id="ocid1.instance.oc1..inst1",
             instance_name="test",
             compartment_id="ocid1.compartment.oc1..test",

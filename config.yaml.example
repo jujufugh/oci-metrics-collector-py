@@ -18,22 +18,26 @@ oci:
   profile: "DEFAULT"
 
 # ---------------------------------------------------------------------------
-# Target Scope
+# Source Tenancies
 # ---------------------------------------------------------------------------
-scope:
-  # Compartment OCID to collect metrics from (REQUIRED).
-  # For tenancy-wide collection, set this to the tenancy OCID and set
-  # compartment_id_in_subtree to true.
-  compartment_id: "ocid1.compartment.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# Each tenancy source is collected in each listed region. The initial
+# compartment strategy is tenancy_subtree, which calls OCI Monitoring with
+# compartment_id=<tenancy_id> and compartment_id_in_subtree=True, then lists
+# Compute instances across active accessible compartments for enrichment.
+tenancies:
+  - name: "parent"
+    tenancy_id: "ocid1.tenancy.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    regions:
+      - "us-ashburn-1"
+    compartment_strategy: "tenancy_subtree"
 
-  # Optional: Tenancy OCID (used for cross-compartment or tenancy-level queries)
-  # tenancy_id: "ocid1.tenancy.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-  # When true, Monitoring queries include compartment_id_in_subtree=True.
-  # OCI requires compartment_id to be the tenancy OCID for subtree metric queries.
-  # Metadata enrichment will enumerate active accessible compartments and list
-  # compute instances in each one.
-  compartment_id_in_subtree: false
+  # Add child tenancies when cross-tenancy policies are in place.
+  # - name: "child-a"
+  #   tenancy_id: "ocid1.tenancy.oc1..bbbbbbbbxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  #   regions:
+  #     - "us-ashburn-1"
+  #     - "us-phoenix-1"
+  #   compartment_strategy: "tenancy_subtree"
 
 # ---------------------------------------------------------------------------
 # Metrics Collection Settings

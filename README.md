@@ -74,8 +74,8 @@ Allow group <your-group> to use log-analytics-log-group in compartment <compartm
 ```
 
 For tenancy-wide collection, grant the principal tenancy-level access and set
-`scope.compartment_id` to the tenancy OCID with
-`scope.compartment_id_in_subtree: true`:
+each `tenancies[].tenancy_id` to a tenancy OCID with
+`compartment_strategy: tenancy_subtree`:
 
 ```
 Allow group <your-group> to read metrics in tenancy
@@ -139,26 +139,34 @@ vi config.yaml
 ```bash
 export OCI_METRICS_ADB_PASSWORD="your_db_password"
 export OCI_METRICS_ADB_WALLET_PASSWORD="your_wallet_password"
-export OCI_METRICS_COMPARTMENT_ID="ocid1.compartment.oc1..xxx"
-export OCI_METRICS_COMPARTMENT_ID_IN_SUBTREE="false"
 ```
 
-### Tenancy-Wide Collection
+### Source Tenancies
 
-By default, the collector is scoped to exactly one compartment. To collect
-metrics across a tenancy, root the scope at the tenancy OCID and enable subtree
-queries:
+Configure one or more parent or child tenancies explicitly. Each tenancy is
+collected in each listed region.
 
 ```yaml
-scope:
-  compartment_id: "ocid1.tenancy.oc1..xxxx"
-  compartment_id_in_subtree: true
+tenancies:
+  - name: "parent"
+    tenancy_id: "ocid1.tenancy.oc1..xxxx"
+    regions:
+      - "us-ashburn-1"
+      - "us-phoenix-1"
+    compartment_strategy: "tenancy_subtree"
+
+  - name: "child-a"
+    tenancy_id: "ocid1.tenancy.oc1..yyyy"
+    regions:
+      - "us-ashburn-1"
+    compartment_strategy: "tenancy_subtree"
 ```
 
-In this mode, Monitoring requests use `compartment_id_in_subtree=True`.
-Enrichment separately enumerates active accessible compartments and lists
-compute instances in each compartment so metric rows can still be joined to
-instance metadata and the source compartment.
+With `tenancy_subtree`, Monitoring requests use the tenancy OCID as
+`compartment_id` and set `compartment_id_in_subtree=True`. Enrichment
+separately enumerates active accessible compartments and lists compute instances
+in each compartment and region. Every record carries `source_tenancy_name`,
+`source_tenancy_id`, and `region` metadata.
 
 ## Usage
 
@@ -203,6 +211,9 @@ The collector auto-creates this table on first run:
 ```sql
 CREATE TABLE OCI_COMPUTE_METRICS (
     COLLECTION_TIME              TIMESTAMP,
+    SOURCE_TENANCY_NAME          VARCHAR2(255),
+    SOURCE_TENANCY_ID            VARCHAR2(255),
+    REGION                       VARCHAR2(100),
     INSTANCE_ID                  VARCHAR2(255),
     INSTANCE_NAME                VARCHAR2(255),
     COMPARTMENT_ID               VARCHAR2(255),
@@ -232,9 +243,10 @@ CREATE TABLE OCI_COMPUTE_METRICS (
 Notes on the schema:
 
 - `COLLECTION_TIME` is plain `TIMESTAMP` (not `TIMESTAMP WITH TIME ZONE`) because Oracle ADB doesn't allow timezone-aware timestamps in a primary key (ORA-02329). Values are stored as UTC.
+- `SOURCE_TENANCY_NAME`, `SOURCE_TENANCY_ID`, and `REGION` identify the configured source tenancy-region scope. `INSTANCE_ID` is treated as globally unique, so the primary key remains `(COLLECTION_TIME, INSTANCE_ID, STATISTIC_TYPE)`.
 - One row per `(instance, timestamp)` holds **all** statistics — the percentile / max columns are populated alongside the mean. The plain `CPU_UTILIZATION_PCT` and `MEMORY_UTILIZATION_PCT` columns hold the **mean** (kept for backward compatibility with older collectors).
 - New rows are written with `STATISTIC_TYPE = 'aggregate'`. Pre-existing rows from older versions of this collector keep their original `STATISTIC_TYPE` value (e.g. `'mean'`) and have `NULL` in the new percentile / max columns. The PK is unchanged.
-- On startup, the writer queries `all_tab_columns` and runs `ALTER TABLE ADD` for any of the extended NUMBER columns (`*_P99`, `*_P95`, `*_MAX`, `LOAD_AVERAGE_P95`, `MEMORY_ALLOCATION_STALLS_P95`) that are missing — historical data is preserved with `NULL`s in the new columns.
+- On startup, the writer queries `all_tab_columns` and runs `ALTER TABLE ADD` for any extended metric columns or source metadata columns that are missing — historical data is preserved with `NULL`s in the new columns.
 
 ### Writing to a different schema (e.g. `OCIRA_DEV`)
 
@@ -292,7 +304,9 @@ This is the recommended setup for running the collector continuously against you
 
 ### 1. Create Dynamic Group + IAM policies
 
-Match the compute instance in a Dynamic Group and grant it `read metrics` + `read instances` on the target compartment (see [IAM Policies](#2-iam-policies) above).
+Match the compute instance in a Dynamic Group and grant it tenancy-level
+`read metrics`, `read instances`, and `inspect compartments` permissions for
+each configured source tenancy (see [IAM Policies](#2-iam-policies) above).
 
 ### 2. Install on the instance
 
@@ -311,9 +325,12 @@ pip install -e .
 oci:
   auth_method: "instance_principal"
 
-scope:
-  compartment_id: "ocid1.compartment.oc1..xxxx"   # target compartment
-  compartment_id_in_subtree: false                # true only with tenancy OCID
+tenancies:
+  - name: "parent"
+    tenancy_id: "ocid1.tenancy.oc1..xxxx"
+    regions:
+      - "us-ashburn-1"
+    compartment_strategy: "tenancy_subtree"
 
 adb:
   enabled: true
@@ -323,11 +340,9 @@ adb:
   table_name: "OCI_COMPUTE_METRICS"               # or SCHEMA.TABLE
 ```
 
-You can pull the compartment OCID from the instance metadata service:
-
-```bash
-curl -s -H "Authorization: Bearer Oracle" http://169.254.169.254/opc/v2/instance/ | jq -r '.compartmentId'
-```
+Use the tenancy OCID from the OCI Console or CLI. Instance metadata exposes the
+instance compartment OCID, not the tenancy root OCID needed for
+`tenancy_subtree`.
 
 ### 4. Store DB passwords for systemd
 

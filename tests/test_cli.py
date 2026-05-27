@@ -6,13 +6,13 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from oci_metrics_collector.cli import cmd_discover
-from oci_metrics_collector.config import CollectorConfig, OciAuthConfig, ScopeConfig
+from oci_metrics_collector.config import CollectorConfig, OciAuthConfig, TenancyConfig
 
 
 @patch("oci_metrics_collector.cli._create_monitoring_client")
 @patch("oci_metrics_collector.cli._setup_logging")
 @patch("oci_metrics_collector.cli.load_config")
-def test_discover_uses_subtree_scope(
+def test_discover_uses_tenancy_region_scope(
     mock_load_config,
     mock_setup_logging,
     mock_create_client,
@@ -20,10 +20,13 @@ def test_discover_uses_subtree_scope(
     """Metric discovery passes the subtree flag through to Monitoring."""
     config = CollectorConfig(
         oci=OciAuthConfig(auth_method="config_file"),
-        scope=ScopeConfig(
-            compartment_id="ocid1.tenancy.oc1..test",
-            compartment_id_in_subtree=True,
-        ),
+        tenancies=[
+            TenancyConfig(
+                name="parent",
+                tenancy_id="ocid1.tenancy.oc1..test",
+                regions=["us-ashburn-1"],
+            )
+        ],
     )
     mock_load_config.return_value = config
     mock_client = MagicMock()
@@ -40,3 +43,4 @@ def test_discover_uses_subtree_scope(
     assert call.args[0] is mock_client.list_metrics
     assert call.kwargs["compartment_id"] == "ocid1.tenancy.oc1..test"
     assert call.kwargs["compartment_id_in_subtree"] is True
+    mock_create_client.assert_called_once_with(config, region="us-ashburn-1")
