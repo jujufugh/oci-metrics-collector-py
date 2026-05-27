@@ -66,7 +66,7 @@ def _create_monitoring_client(config: CollectorConfig):
 def collect_metrics(config: CollectorConfig) -> List[MetricDataPoint]:
     """
     Collect compute metrics from OCI Monitoring for all instances
-    in the configured compartment.
+    in the configured compartment or tenancy subtree.
 
     Queries each configured metric (e.g., CpuUtilization, MemoryUtilization)
     using MQL and returns normalized MetricDataPoint objects.
@@ -79,6 +79,7 @@ def collect_metrics(config: CollectorConfig) -> List[MetricDataPoint]:
     """
     client = _create_monitoring_client(config)
     compartment_id = config.scope.compartment_id
+    compartment_id_in_subtree = config.scope.compartment_id_in_subtree
     end_time = datetime.now(timezone.utc)
     start_time = end_time - timedelta(minutes=config.metrics.lookback_minutes)
 
@@ -87,11 +88,13 @@ def collect_metrics(config: CollectorConfig) -> List[MetricDataPoint]:
     for metric_name, stats in config.metrics.metric_stats.items():
         for stat in stats:
             logger.info(
-                "Collecting metric: %s (namespace=%s, resolution=%s, stat=%s)",
+                "Collecting metric: %s "
+                "(namespace=%s, resolution=%s, stat=%s, subtree=%s)",
                 metric_name,
                 config.metrics.namespace,
                 config.metrics.resolution,
                 stat,
+                compartment_id_in_subtree,
             )
 
             query = f"{metric_name}[{config.metrics.resolution}].{_stat_to_mql(stat)}"
@@ -108,6 +111,7 @@ def collect_metrics(config: CollectorConfig) -> List[MetricDataPoint]:
                 response = client.summarize_metrics_data(
                     compartment_id=compartment_id,
                     summarize_metrics_data_details=summarize_details,
+                    compartment_id_in_subtree=compartment_id_in_subtree,
                 )
             except oci.exceptions.ServiceError as e:
                 logger.error(
@@ -123,6 +127,12 @@ def collect_metrics(config: CollectorConfig) -> List[MetricDataPoint]:
             for metric_data in response.data:
                 dimensions = metric_data.dimensions or {}
                 instance_id = dimensions.get("resourceId", "unknown")
+                metric_compartment_id = getattr(metric_data, "compartment_id", None)
+                if (
+                    not isinstance(metric_compartment_id, str)
+                    or not metric_compartment_id
+                ):
+                    metric_compartment_id = compartment_id
 
                 for dp in metric_data.aggregated_datapoints:
                     all_datapoints.append(
@@ -132,7 +142,7 @@ def collect_metrics(config: CollectorConfig) -> List[MetricDataPoint]:
                             timestamp=dp.timestamp,
                             value=dp.value,
                             statistic=stat,
-                            compartment_id=compartment_id,
+                            compartment_id=metric_compartment_id,
                         )
                     )
 

@@ -73,6 +73,17 @@ Allow group <your-group> to read instances in compartment <compartment-name>
 Allow group <your-group> to use log-analytics-log-group in compartment <compartment-name>
 ```
 
+For tenancy-wide collection, grant the principal tenancy-level access and set
+`scope.compartment_id` to the tenancy OCID with
+`scope.compartment_id_in_subtree: true`:
+
+```
+Allow group <your-group> to read metrics in tenancy
+Allow group <your-group> to read instances in tenancy
+Allow group <your-group> to inspect compartments in tenancy
+Allow group <your-group> to use log-analytics-log-group in tenancy
+```
+
 For **instance principal** auth (running on an OCI compute instance), create a Dynamic Group that matches the instance, then grant it the same permissions:
 
 ```
@@ -129,7 +140,25 @@ vi config.yaml
 export OCI_METRICS_ADB_PASSWORD="your_db_password"
 export OCI_METRICS_ADB_WALLET_PASSWORD="your_wallet_password"
 export OCI_METRICS_COMPARTMENT_ID="ocid1.compartment.oc1..xxx"
+export OCI_METRICS_COMPARTMENT_ID_IN_SUBTREE="false"
 ```
+
+### Tenancy-Wide Collection
+
+By default, the collector is scoped to exactly one compartment. To collect
+metrics across a tenancy, root the scope at the tenancy OCID and enable subtree
+queries:
+
+```yaml
+scope:
+  compartment_id: "ocid1.tenancy.oc1..xxxx"
+  compartment_id_in_subtree: true
+```
+
+In this mode, Monitoring requests use `compartment_id_in_subtree=True`.
+Enrichment separately enumerates active accessible compartments and lists
+compute instances in each compartment so metric rows can still be joined to
+instance metadata and the source compartment.
 
 ## Usage
 
@@ -284,6 +313,7 @@ oci:
 
 scope:
   compartment_id: "ocid1.compartment.oc1..xxxx"   # target compartment
+  compartment_id_in_subtree: false                # true only with tenancy OCID
 
 adb:
   enabled: true

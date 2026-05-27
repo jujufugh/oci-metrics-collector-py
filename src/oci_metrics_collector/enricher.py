@@ -9,7 +9,7 @@ derived fields like memory_used_gbs and cpu_usage_ocpus.
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import oci
 
@@ -144,6 +144,7 @@ class InstanceMetadataCache:
         self._config = config
         self._cache: Dict[str, InstanceMetadata] = {}
         self._client = self._create_compute_client()
+        self._identity_client = None
 
     def _create_compute_client(self):
         """Create an OCI ComputeClient with the appropriate auth."""
@@ -152,59 +153,103 @@ class InstanceMetadataCache:
             return oci.core.ComputeClient(config={}, signer=signer)
         return oci.core.ComputeClient(oci_config)
 
+    def _create_identity_client(self):
+        """Create an OCI IdentityClient with the appropriate auth."""
+        oci_config, signer = _build_oci_config(self._config)
+        if signer:
+            return oci.identity.IdentityClient(config={}, signer=signer)
+        return oci.identity.IdentityClient(oci_config)
+
+    def _get_instance_compartment_ids(self) -> List[str]:
+        """Return the compartments whose instances should be cached."""
+        compartment_id = self._config.scope.compartment_id
+        if not self._config.scope.compartment_id_in_subtree:
+            return [compartment_id]
+
+        if self._identity_client is None:
+            self._identity_client = self._create_identity_client()
+
+        logger.info("Listing active compartments under tenancy: %s", compartment_id)
+        compartments = oci.pagination.list_call_get_all_results(
+            self._identity_client.list_compartments,
+            compartment_id=compartment_id,
+            compartment_id_in_subtree=True,
+            access_level="ACCESSIBLE",
+            lifecycle_state="ACTIVE",
+        ).data
+
+        compartment_ids: Set[str] = {compartment_id}
+        compartment_ids.update(comp.id for comp in compartments)
+        return sorted(compartment_ids)
+
+    def _cache_instance(self, inst) -> None:
+        """Cache one OCI compute instance response object."""
+        if inst.lifecycle_state == "TERMINATED":
+            return
+
+        # Determine OCPUs and memory
+        ocpus = None
+        memory_gbs = None
+
+        if inst.shape_config:
+            # Flex shapes: read from shape_config
+            ocpus = inst.shape_config.ocpus
+            memory_gbs = inst.shape_config.memory_in_gbs
+        else:
+            # Fixed shapes: lookup table
+            specs = FIXED_SHAPE_SPECS.get(inst.shape)
+            if specs:
+                ocpus, memory_gbs = specs
+            else:
+                logger.warning(
+                    "Unknown shape '%s' for instance %s - "
+                    "allocated resources will be None",
+                    inst.shape,
+                    inst.display_name,
+                )
+
+        self._cache[inst.id] = InstanceMetadata(
+            instance_id=inst.id,
+            display_name=inst.display_name,
+            shape=inst.shape,
+            lifecycle_state=inst.lifecycle_state,
+            availability_domain=inst.availability_domain,
+            fault_domain=getattr(inst, "fault_domain", None),
+            compartment_id=inst.compartment_id,
+            ocpus=ocpus,
+            memory_in_gbs=memory_gbs,
+        )
+
     def refresh(self) -> None:
         """
         Refresh the instance metadata cache by listing all instances
-        in the configured compartment.
+        in the configured compartment or tenancy subtree.
         """
-        compartment_id = self._config.scope.compartment_id
-        logger.info("Refreshing instance metadata for compartment: %s", compartment_id)
-
         self._cache.clear()
+        compartment_ids = self._get_instance_compartment_ids()
+        logger.info(
+            "Refreshing instance metadata from %d compartment(s)",
+            len(compartment_ids),
+        )
 
-        # Paginate through all instances
-        instances = oci.pagination.list_call_get_all_results(
-            self._client.list_instances,
-            compartment_id=compartment_id,
-        ).data
-
-        for inst in instances:
-            # Skip terminated instances — no metrics expected
-            if inst.lifecycle_state == "TERMINATED":
+        for compartment_id in compartment_ids:
+            logger.debug("Listing instances in compartment: %s", compartment_id)
+            try:
+                instances = oci.pagination.list_call_get_all_results(
+                    self._client.list_instances,
+                    compartment_id=compartment_id,
+                ).data
+            except oci.exceptions.ServiceError as e:
+                logger.warning(
+                    "Failed to list instances in compartment %s: %s (status=%d)",
+                    compartment_id,
+                    e.message,
+                    e.status,
+                )
                 continue
 
-            # Determine OCPUs and memory
-            ocpus = None
-            memory_gbs = None
-
-            if inst.shape_config:
-                # Flex shapes: read from shape_config
-                ocpus = inst.shape_config.ocpus
-                memory_gbs = inst.shape_config.memory_in_gbs
-            else:
-                # Fixed shapes: lookup table
-                specs = FIXED_SHAPE_SPECS.get(inst.shape)
-                if specs:
-                    ocpus, memory_gbs = specs
-                else:
-                    logger.warning(
-                        "Unknown shape '%s' for instance %s — "
-                        "allocated resources will be None",
-                        inst.shape,
-                        inst.display_name,
-                    )
-
-            self._cache[inst.id] = InstanceMetadata(
-                instance_id=inst.id,
-                display_name=inst.display_name,
-                shape=inst.shape,
-                lifecycle_state=inst.lifecycle_state,
-                availability_domain=inst.availability_domain,
-                fault_domain=getattr(inst, "fault_domain", None),
-                compartment_id=inst.compartment_id,
-                ocpus=ocpus,
-                memory_in_gbs=memory_gbs,
-            )
+            for inst in instances:
+                self._cache_instance(inst)
 
         logger.info("Cached metadata for %d instances", len(self._cache))
 

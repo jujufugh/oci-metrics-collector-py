@@ -46,6 +46,7 @@ def _make_mock_instance(
     ocpus=None,
     memory_gbs=None,
     lifecycle_state="RUNNING",
+    compartment_id="ocid1.compartment.oc1..test",
 ):
     """Helper to create a mock OCI instance object."""
     inst = MagicMock()
@@ -55,7 +56,7 @@ def _make_mock_instance(
     inst.lifecycle_state = lifecycle_state
     inst.availability_domain = "US-ASHBURN-AD-1"
     inst.fault_domain = "FAULT-DOMAIN-1"
-    inst.compartment_id = "ocid1.compartment.oc1..test"
+    inst.compartment_id = compartment_id
 
     if ocpus is not None:
         inst.shape_config = MagicMock()
@@ -164,6 +165,91 @@ class TestEnrichMetrics:
         assert len(result) == 1
         assert result[0].cpu_utilization_pct == 25.0
         assert result[0].memory_utilization_pct == 50.0
+
+
+class TestInstanceMetadataCache:
+    """Tests for compute metadata discovery."""
+
+    @patch("oci_metrics_collector.enricher.oci.pagination.list_call_get_all_results")
+    @patch("oci_metrics_collector.enricher.oci.identity.IdentityClient")
+    @patch("oci_metrics_collector.enricher.oci.core.ComputeClient")
+    @patch("oci_metrics_collector.enricher._build_oci_config")
+    def test_subtree_refresh_lists_instances_in_each_compartment(
+        self,
+        mock_build_config,
+        MockComputeClient,
+        MockIdentityClient,
+        mock_list_all,
+    ):
+        """Subtree metadata refresh enumerates compartments before instances."""
+        mock_build_config.return_value = ({}, None)
+        mock_compute = MagicMock()
+        mock_identity = MagicMock()
+        MockComputeClient.return_value = mock_compute
+        MockIdentityClient.return_value = mock_identity
+
+        child1 = MagicMock()
+        child1.id = "ocid1.compartment.oc1..child1"
+        child2 = MagicMock()
+        child2.id = "ocid1.compartment.oc1..child2"
+
+        instances_by_compartment = {
+            "ocid1.tenancy.oc1..test": [
+                _make_mock_instance(
+                    "ocid1.instance.oc1..root",
+                    "root-instance",
+                    "VM.Standard2.1",
+                    compartment_id="ocid1.tenancy.oc1..test",
+                )
+            ],
+            "ocid1.compartment.oc1..child1": [
+                _make_mock_instance(
+                    "ocid1.instance.oc1..child1",
+                    "child1-instance",
+                    "VM.Standard2.1",
+                    compartment_id="ocid1.compartment.oc1..child1",
+                )
+            ],
+            "ocid1.compartment.oc1..child2": [
+                _make_mock_instance(
+                    "ocid1.instance.oc1..child2",
+                    "child2-instance",
+                    "VM.Standard2.1",
+                    compartment_id="ocid1.compartment.oc1..child2",
+                )
+            ],
+        }
+
+        def list_all_side_effect(func, **kwargs):
+            if func is mock_identity.list_compartments:
+                return MagicMock(data=[child1, child2])
+            if func is mock_compute.list_instances:
+                return MagicMock(data=instances_by_compartment[kwargs["compartment_id"]])
+            raise AssertionError(f"Unexpected paginated function: {func}")
+
+        mock_list_all.side_effect = list_all_side_effect
+
+        cache = InstanceMetadataCache(
+            CollectorConfig(
+                oci=OciAuthConfig(auth_method="config_file"),
+                scope=ScopeConfig(
+                    compartment_id="ocid1.tenancy.oc1..test",
+                    compartment_id_in_subtree=True,
+                ),
+            )
+        )
+        cache.refresh()
+
+        assert cache.get("ocid1.instance.oc1..root").display_name == "root-instance"
+        assert cache.get("ocid1.instance.oc1..child1").compartment_id == (
+            "ocid1.compartment.oc1..child1"
+        )
+        listed_instance_compartments = {
+            call.kwargs["compartment_id"]
+            for call in mock_list_all.call_args_list
+            if call.args[0] is mock_compute.list_instances
+        }
+        assert listed_instance_compartments == set(instances_by_compartment)
 
 
 class TestDerivedFieldCalculations:

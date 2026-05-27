@@ -21,11 +21,19 @@ oci:
 # Target Scope
 # ---------------------------------------------------------------------------
 scope:
-  # Compartment OCID to collect metrics from (REQUIRED)
+  # Compartment OCID to collect metrics from (REQUIRED).
+  # For tenancy-wide collection, set this to the tenancy OCID and set
+  # compartment_id_in_subtree to true.
   compartment_id: "ocid1.compartment.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
   # Optional: Tenancy OCID (used for cross-compartment or tenancy-level queries)
   # tenancy_id: "ocid1.tenancy.oc1..aaaaaaaaxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+  # When true, Monitoring queries include compartment_id_in_subtree=True.
+  # OCI requires compartment_id to be the tenancy OCID for subtree metric queries.
+  # Metadata enrichment will enumerate active accessible compartments and list
+  # compute instances in each one.
+  compartment_id_in_subtree: false
 
 # ---------------------------------------------------------------------------
 # Metrics Collection Settings

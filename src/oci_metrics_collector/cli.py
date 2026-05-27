@@ -79,7 +79,7 @@ def cmd_test_connection(args) -> None:
 
 
 def cmd_discover(args) -> None:
-    """Discover available metrics in the target compartment."""
+    """Discover available metrics in the target compartment or tenancy subtree."""
     config = load_config(args.config)
     _setup_logging(config.orchestration.log_level)
 
@@ -87,8 +87,10 @@ def cmd_discover(args) -> None:
 
     client = _create_monitoring_client(config)
     compartment_id = config.scope.compartment_id
+    compartment_id_in_subtree = config.scope.compartment_id_in_subtree
 
-    print(f"\nDiscovering metrics in compartment: {compartment_id}")
+    scope_label = "tenancy subtree" if compartment_id_in_subtree else "compartment"
+    print(f"\nDiscovering metrics in {scope_label}: {compartment_id}")
     print(f"Namespace filter: {args.namespace or 'all'}\n")
 
     list_details = oci.monitoring.models.ListMetricsDetails(
@@ -100,6 +102,7 @@ def cmd_discover(args) -> None:
             client.list_metrics,
             compartment_id=compartment_id,
             list_metrics_details=list_details,
+            compartment_id_in_subtree=compartment_id_in_subtree,
         )
     except oci.exceptions.ServiceError as e:
         print(f"Error: {e.message} (status={e.status})", file=sys.stderr)
