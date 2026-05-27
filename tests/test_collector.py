@@ -106,6 +106,39 @@ class TestCollectMetrics:
         assert result[0].value == 45.5
 
     @patch("oci_metrics_collector.collector._create_monitoring_client")
+    def test_collect_uses_subtree_scope_and_metric_compartment(
+        self,
+        mock_create_client,
+        config,
+    ):
+        """Subtree collection passes the OCI flag and keeps metric compartment IDs."""
+        config.scope.compartment_id = "ocid1.tenancy.oc1..test"
+        config.scope.compartment_id_in_subtree = True
+
+        mock_dp = MagicMock()
+        mock_dp.timestamp = datetime(2026, 4, 13, 10, 0, 0, tzinfo=timezone.utc)
+        mock_dp.value = 45.5
+
+        mock_metric = MagicMock()
+        mock_metric.compartment_id = "ocid1.compartment.oc1..child"
+        mock_metric.dimensions = {"resourceId": "ocid1.instance.oc1..inst1"}
+        mock_metric.aggregated_datapoints = [mock_dp]
+
+        mock_response = MagicMock()
+        mock_response.data = [mock_metric]
+
+        mock_client = MagicMock()
+        mock_client.summarize_metrics_data.return_value = mock_response
+        mock_create_client.return_value = mock_client
+
+        result = collect_metrics(config)
+
+        assert result[0].compartment_id == "ocid1.compartment.oc1..child"
+        first_call = mock_client.summarize_metrics_data.call_args
+        assert first_call.kwargs["compartment_id"] == "ocid1.tenancy.oc1..test"
+        assert first_call.kwargs["compartment_id_in_subtree"] is True
+
+    @patch("oci_metrics_collector.collector._create_monitoring_client")
     def test_collect_empty_response(self, mock_create_client, config):
         """Test that an empty response returns no data points."""
         mock_response = MagicMock()

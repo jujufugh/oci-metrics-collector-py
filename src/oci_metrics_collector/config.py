@@ -29,6 +29,7 @@ class ScopeConfig:
     """Target compartment/tenancy scope."""
     compartment_id: str = ""
     tenancy_id: Optional[str] = None
+    compartment_id_in_subtree: bool = False
 
 
 @dataclass
@@ -95,6 +96,8 @@ def _apply_env_overrides(config: CollectorConfig) -> None:
         OCI_METRICS_ADB_PASSWORD         → adb.password
         OCI_METRICS_ADB_WALLET_PASSWORD  → adb.wallet_password
         OCI_METRICS_COMPARTMENT_ID       → scope.compartment_id
+        OCI_METRICS_COMPARTMENT_ID_IN_SUBTREE
+                                         → scope.compartment_id_in_subtree
         OCI_METRICS_LA_NAMESPACE         → log_analytics.namespace
         OCI_METRICS_LA_LOG_GROUP_ID      → log_analytics.log_group_id
     """
@@ -111,6 +114,42 @@ def _apply_env_overrides(config: CollectorConfig) -> None:
         if value:
             setattr(getattr(config, section), key, value)
             logger.debug("Config override from env var: %s", env_var)
+
+    subtree = os.environ.get("OCI_METRICS_COMPARTMENT_ID_IN_SUBTREE")
+    if subtree:
+        config.scope.compartment_id_in_subtree = _parse_bool_env(
+            "OCI_METRICS_COMPARTMENT_ID_IN_SUBTREE",
+            subtree,
+        )
+        logger.debug(
+            "Config override from env var: OCI_METRICS_COMPARTMENT_ID_IN_SUBTREE"
+        )
+
+
+def _parse_bool_env(name: str, value: str) -> bool:
+    """Parse a boolean environment variable value."""
+    return _parse_bool_value(name, value)
+
+
+def _parse_bool_value(name: str, value) -> bool:
+    """Parse a bool or string boolean config value."""
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{name} must be a boolean value "
+            "(true/false, yes/no, on/off, or 1/0)."
+        )
+
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "y", "on"):
+        return True
+    if normalized in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(
+        f"{name} must be a boolean value "
+        "(true/false, yes/no, on/off, or 1/0)."
+    )
 
 
 def _dict_to_dataclass(data: dict, cls):
@@ -162,12 +201,26 @@ def load_config(config_path: str) -> CollectorConfig:
 
     # Apply environment variable overrides
     _apply_env_overrides(config)
+    config.scope.compartment_id_in_subtree = _parse_bool_value(
+        "scope.compartment_id_in_subtree",
+        config.scope.compartment_id_in_subtree,
+    )
 
     # Validate required fields
     if not config.scope.compartment_id:
         raise ValueError(
             "scope.compartment_id is required. Set it in config.yaml "
             "or via OCI_METRICS_COMPARTMENT_ID env var."
+        )
+
+    if (
+        config.scope.compartment_id_in_subtree
+        and not config.scope.compartment_id.startswith("ocid1.tenancy.")
+    ):
+        raise ValueError(
+            "scope.compartment_id_in_subtree requires scope.compartment_id "
+            "to be the tenancy OCID. OCI Monitoring only supports subtree "
+            "metric queries from the tenancy root."
         )
 
     logger.info("Configuration loaded from: %s", path)
